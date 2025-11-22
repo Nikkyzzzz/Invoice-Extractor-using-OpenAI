@@ -1,0 +1,10 @@
+streamlit
+pandas
+pydantic
+Pillow
+pytesseract
+cohere
+openai
+PyMuPDF
+python-dotenv
+openpyxl
