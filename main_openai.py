@@ -3,7 +3,6 @@ import io
 import json
 from pathlib import Path
 from typing import List, Optional, Callable
-
 import streamlit as st
 import pandas as pd
 from pydantic import BaseModel, ValidationError, Field
@@ -236,18 +235,20 @@ st.markdown('<div class="app-header"><h1 style="margin:0;">Invoice Reader</h1><s
 with st.container():
     cols = st.columns([3, 2])
     with cols[0]:
-        file = st.file_uploader("Upload invoice (PDF/Image)", type=["pdf", "png", "jpg", "jpeg", "tiff"])
+        files = st.file_uploader("Upload invoice(s) (PDF/Image)", type=["pdf", "png", "jpg", "jpeg", "tiff"], accept_multiple_files=True)
     with cols[1]:
         st.selectbox("Mode", ["Extract JSON"], index=0, key="mode_select")
         st.text_input("Currency hint (optional)", value="", key="currency_hint")
 
-status_cols = st.columns(3)
+status_cols = st.columns(4)
 with status_cols[0]:
-    st.metric("OpenAI Model", model if model else "Not set")
+    st.metric("Uploaded", len(files) if files else 0)
 with status_cols[1]:
-    st.metric("OCR Lang", ocr_lang if ocr_lang else "Not set")
+    st.metric("OpenAI Model", model if model else "Not set")
 with status_cols[2]:
-    st.metric("Tesseract", "Configured" if pytesseract.pytesseract.tesseract_cmd else "Default")
+    st.metric("OCR Lang", ocr_lang if ocr_lang else "Not set")
+with status_cols[3]:
+    st.metric("Tesseract", "✓" if pytesseract.pytesseract.tesseract_cmd else "Default")
 
 if not api_key:
     st.info("Set OPENAI_API_KEY in .env")
@@ -256,9 +257,13 @@ if not model:
 if not ocr_lang:
     st.info("Set TESSERACT_LANG in .env (e.g., eng)")
 
-raw_text = ""
-metadata = {}
-if file is not None:
+def process_single_invoice(file, ocr_lang, api_key, model):
+    """Process a single invoice file"""
+    st.divider()
+    st.markdown(f"### 📄 {file.name}")
+    
+    raw_text = ""
+    metadata = {}
     kind = "pdf" if file.type == "application/pdf" else "image"
     try:
         if kind == "pdf":
@@ -269,86 +274,114 @@ if file is not None:
     except Exception:
         metadata = {"name": file.name, "type": "Unknown", "size_kb": round(len(file.getvalue())/1024, 1), "pages": "-"}
 
-    with st.expander("File details", expanded=True):
+    with st.expander("File details", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
         c1.write(f"**Name**\n\n{metadata.get('name','-')}")
         c2.write(f"**Type**\n\n{metadata.get('type','-')}")
         c3.write(f"**Size (KB)**\n\n{metadata.get('size_kb','-')}")
         c4.write(f"**Pages**\n\n{metadata.get('pages','-')}")
+    
+    progress = st.progress(0.0, text="Starting OCR…")
+    def on_progress(done, total):
+        pct = done / max(total, 1)
+        progress.progress(pct, text=f"OCR {done}/{total} pages")
 
-    if ocr_lang and api_key and model:
-        progress = st.progress(0.0, text="Starting OCR…")
-        def on_progress(done, total):
-            pct = done / max(total, 1)
-            progress.progress(pct, text=f"OCR {done}/{total} pages")
-
-        with st.status("Running OCR", expanded=False) as s:
+    with st.status("Running OCR", expanded=False) as s:
             raw_text = ocr_any(file.read(), kind, ocr_lang, on_progress=on_progress)
             progress.progress(1.0, text="OCR complete")
             s.update(label="OCR complete", state="complete")
 
-        left, right = st.columns([1, 1])
-        with left:
-            st.subheader("OCR Preview")
-            st.text_area("Text", raw_text[:20000], height=420)
+    left, right = st.columns([1, 1])
+    with left:
+        st.subheader("OCR Preview")
+        st.text_area("Text", raw_text[:20000], height=420, key=f"ocr_{file.name}")
 
-        with st.status("Extracting structured JSON with OpenAI", expanded=False) as s2:
+    with st.status("Extracting structured JSON with OpenAI", expanded=False) as s2:
             data = openai_extract(raw_text, model, api_key, st.session_state.get("currency_hint") or None)
             s2.update(label="Extraction complete", state="complete")
 
-        tabs = st.tabs(["Structured JSON", "Header Fields", "Flat Rows", "Downloads"])
-        with tabs[0]:
-            st.code(json.dumps(data, ensure_ascii=False, indent=2))
-        with tabs[1]:
-            meta = {k: v for k, v in data.items() if k not in ("line_items",)}
-            if meta:
-                st.json(meta)
-            else:
-                st.write("No header fields parsed.")
-        with tabs[2]:
+    tabs = st.tabs(["Structured JSON", "Header Fields", "Flat Rows", "Downloads"])
+    with tabs[0]:
+        st.code(json.dumps(data, ensure_ascii=False, indent=2))
+    with tabs[1]:
+        meta = {k: v for k, v in data.items() if k not in ("line_items",)}
+        if meta:
+            st.json(meta)
+        else:
+            st.write("No header fields parsed.")
+    with tabs[2]:
+        flat = to_flat_table(data)
+        if not flat.empty:
+            st.dataframe(flat, use_container_width=True)
+        else:
+            st.write("No rows to display.")
+    with tabs[3]:
+        area = st.container()
+        with area:
             flat = to_flat_table(data)
-            if not flat.empty:
-                st.dataframe(flat, use_container_width=True)
-            else:
-                st.write("No rows to display.")
-        with tabs[3]:
-            area = st.container()
-            with area:
-                if 'flat' not in locals():
-                    flat = to_flat_table(data)
-                csv_bytes = flat.to_csv(index=False).encode("utf-8") if not flat.empty else "".encode("utf-8")
-                xlsx_bytes = export_invoice_json_to_excel(data)
-                st.markdown('<div class="downloads">', unsafe_allow_html=True)
-                st.download_button("CSV (Flat)", data=csv_bytes, file_name="invoice_flat.csv", disabled=flat.empty)
-                st.download_button("Excel (All Sheets)", data=xlsx_bytes, file_name="invoice_output.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.download_button("JSON", data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
-                                   file_name="invoice.json")
-                st.markdown('</div>', unsafe_allow_html=True)
+            csv_bytes = flat.to_csv(index=False).encode("utf-8") if not flat.empty else "".encode("utf-8")
+            xlsx_bytes = export_invoice_json_to_excel(data)
+            st.markdown('<div class="downloads">', unsafe_allow_html=True)
+            filename_base = Path(file.name).stem
+            st.download_button("CSV (Flat)", data=csv_bytes, file_name=f"{filename_base}_flat.csv", disabled=flat.empty, key=f"csv_{file.name}")
+            st.download_button("Excel (All Sheets)", data=xlsx_bytes, file_name=f"{filename_base}_output.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"xlsx_{file.name}")
+            st.download_button("JSON", data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                               file_name=f"{filename_base}.json", key=f"json_{file.name}")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-        kpi_cols = st.columns(4)
-        try:
-            li = data.get("line_items") or []
-            kpi_cols[0].metric("Line items", len(li))
-        except Exception:
-            kpi_cols[0].metric("Line items", 0)
-        kpi_cols[1].metric("Subtotal", str(data.get("subtotal") if isinstance(data, dict) else "-"))
-        kpi_cols[2].metric("Tax %", str(data.get("tax_percent") if isinstance(data, dict) else "-"))
-        kpi_cols[3].metric("Total", str(data.get("total") if isinstance(data, dict) else "-"))
+    kpi_cols = st.columns(4)
+    try:
+        li = data.get("line_items") or []
+        kpi_cols[0].metric("Line items", len(li))
+    except Exception:
+        kpi_cols[0].metric("Line items", 0)
+    kpi_cols[1].metric("Subtotal", str(data.get("subtotal") if isinstance(data, dict) else "-"))
+    kpi_cols[2].metric("Tax %", str(data.get("tax_percent") if isinstance(data, dict) else "-"))
+    kpi_cols[3].metric("Total", str(data.get("total") if isinstance(data, dict) else "-"))
 
-        st.divider()
-        util_cols = st.columns([1,1,1])
-        with util_cols[0]:
-            if st.button("Clear"):
-                st.cache_data.clear()
-                st.experimental_rerun()
-        with util_cols[1]:
-            st.write("")
-        with util_cols[2]:
-            st.caption("High-DPI PDF rasterization enabled")
-
+# Main processing logic
+if files and ocr_lang and api_key and model:
+    if len(files) == 1:
+        process_single_invoice(files[0], ocr_lang, api_key, model)
     else:
-        st.warning("Configure .env first: OPENAI_API_KEY, OPENAI_MODEL, TESSERACT_LANG")
+        st.info(f"📋 Processing {len(files)} invoices...")
+        
+        # Option to process all or select specific ones
+        col_process = st.columns([2, 1])
+        with col_process[0]:
+            process_all = st.checkbox("Process all invoices", value=True)
+        
+        if not process_all:
+            selected_files = st.multiselect(
+                "Select invoices to process:",
+                options=files,
+                format_func=lambda x: x.name,
+                default=files
+            )
+        else:
+            selected_files = files
+        
+        if st.button(f"🚀 Start Processing ({len(selected_files)} invoice{'s' if len(selected_files) != 1 else ''})", type="primary"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, file in enumerate(selected_files):
+                status_text.text(f"Processing {idx + 1}/{len(selected_files)}: {file.name}")
+                process_single_invoice(file, ocr_lang, api_key, model)
+                progress_bar.progress((idx + 1) / len(selected_files))
+            
+            status_text.empty()
+            progress_bar.empty()
+            st.success(f"✅ Successfully processed {len(selected_files)} invoice(s)!")
+            
+            # Option to download all results
+            st.divider()
+            st.subheader("📦 Batch Download")
+            st.caption("Download all processed invoices as a consolidated file")
+            
+elif files and not (ocr_lang and api_key and model):
+    st.warning("⚠️ Configure .env first: OPENAI_API_KEY, OPENAI_MODEL, TESSERACT_LANG")
 
 st.markdown("---")
-st.caption("Clean UI • High-DPI PDF rasterization • Progress-aware OCR • OpenAI JSON extraction • CSV/Excel exports")
+st.caption("Clean UI • High-DPI PDF rasterization • Progress-aware OCR • OpenAI JSON extraction • CSV/Excel/JSON exports • Multi-file batch processing")
